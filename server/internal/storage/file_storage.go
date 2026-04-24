@@ -37,7 +37,7 @@ func NewFileStorageEngine(rootDir string) *FileStorageEngine {
 		rootDir:    rootDir,
 		tableLocks: make(map[string]*sync.RWMutex),
 	}
-	_ = os.MkdirAll(s.kingdomsDir(), 0o755)
+	_ = os.MkdirAll(s.databasesDir(), 0o755)
 	return s
 }
 
@@ -100,12 +100,12 @@ func (s *FileStorageEngine) ListDatabases() ([]string, error) {
 	s.globalMu.RLock()
 	defer s.globalMu.RUnlock()
 
-	entries, err := os.ReadDir(s.kingdomsDir())
+	entries, err := os.ReadDir(s.databasesDir())
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return []string{}, nil
 		}
-		return nil, fmt.Errorf("read kingdoms directory: %w", err)
+		return nil, fmt.Errorf("read databases directory: %w", err)
 	}
 
 	names := make([]string, 0, len(entries))
@@ -362,12 +362,12 @@ func (s *FileStorageEngine) DeleteRows(dbName, tableName string, indices []int) 
 	return len(indexSet), nil
 }
 
-func (s *FileStorageEngine) kingdomsDir() string {
-	return filepath.Join(s.rootDir, "kingdoms")
+func (s *FileStorageEngine) databasesDir() string {
+	return filepath.Join(s.rootDir, "databases")
 }
 
 func (s *FileStorageEngine) dbDir(dbName string) string {
-	return filepath.Join(s.kingdomsDir(), dbName)
+	return filepath.Join(s.databasesDir(), dbName)
 }
 
 func (s *FileStorageEngine) tableDir(dbName, tableName string) string {
