@@ -1,0 +1,8 @@
+build/
+client/build/
+data/*
+!data/kingdoms/
+!data/kingdoms/.gitkeep
+*.dylib
+*.so
+*.a
