@@ -34,11 +34,42 @@ type DropTableStatement struct {
 	TableName string
 }
 
+type CreateIndexStatement struct {
+	IndexName  string
+	TableName  string
+	ColumnName string
+}
+
+type DropIndexStatement struct {
+	IndexName string
+	TableName string
+}
+
 // DML.
+type SelectItem struct {
+	Type       string // all | column | agg | score
+	ColumnName string
+	AggFunc    string
+	Alias      string
+}
+
+type OrderByItem struct {
+	Column string
+	Desc   bool
+}
+
+type LimitClause struct {
+	Count  int
+	Offset int
+}
+
 type SelectStatement struct {
-	Columns   []string // empty means '*'
+	Items     []SelectItem
 	TableName string
 	Where     Expression
+	GroupBy   []string
+	OrderBy   []OrderByItem
+	Limit     *LimitClause
 }
 
 type InsertStatement struct {
@@ -68,6 +99,8 @@ func (*DropDatabaseStatement) statementNode()   {}
 func (*UseDatabaseStatement) statementNode()    {}
 func (*CreateTableStatement) statementNode()    {}
 func (*DropTableStatement) statementNode()      {}
+func (*CreateIndexStatement) statementNode()    {}
+func (*DropIndexStatement) statementNode()      {}
 func (*SelectStatement) statementNode()         {}
 func (*InsertStatement) statementNode()         {}
 func (*UpdateStatement) statementNode()         {}
@@ -78,6 +111,8 @@ func (*DropDatabaseStatement) StatementType() string   { return "DROP_DATABASE" 
 func (*UseDatabaseStatement) StatementType() string    { return "USE_DATABASE" }
 func (*CreateTableStatement) StatementType() string    { return "CREATE_TABLE" }
 func (*DropTableStatement) StatementType() string      { return "DROP_TABLE" }
+func (*CreateIndexStatement) StatementType() string    { return "CREATE_INDEX" }
+func (*DropIndexStatement) StatementType() string      { return "DROP_INDEX" }
 func (*SelectStatement) StatementType() string         { return "SELECT" }
 func (*InsertStatement) StatementType() string         { return "INSERT" }
 func (*UpdateStatement) StatementType() string         { return "UPDATE" }
@@ -109,6 +144,17 @@ type BinaryExpr struct {
 	Right    Expression
 }
 
+type MatchExpr struct {
+	Column string
+	Query  string
+}
+
+type LikeExpr struct {
+	Column  string
+	Pattern string
+	Negated bool
+}
+
 type AndExpr struct {
 	Left  Expression
 	Right Expression
@@ -126,6 +172,8 @@ type NotExpr struct {
 func (Value) expressionNode()       {}
 func (*ColumnRef) expressionNode()  {}
 func (*BinaryExpr) expressionNode() {}
+func (*MatchExpr) expressionNode()  {}
+func (*LikeExpr) expressionNode()   {}
 func (*AndExpr) expressionNode()    {}
 func (*OrExpr) expressionNode()     {}
 func (*NotExpr) expressionNode()    {}

@@ -9,33 +9,62 @@ import (
 	"pixeldb/internal/storage"
 )
 
-func evalExpr(expr parser.Expression, row storage.Row, schema *storage.TableSchema) (bool, error) {
+type EvalContext struct {
+	RowID       int64
+	MatchScores map[string]float64 // key: lower-cased column name
+}
+
+func evalExpr(expr parser.Expression, row storage.Row, schema *storage.TableSchema, evalCtx *EvalContext) (bool, error) {
 	switch e := expr.(type) {
 	case nil:
 		return true, nil
 	case *parser.BinaryExpr:
-		return evalBinary(e, row, schema)
+		return evalBinary(e, row, schema, evalCtx)
 	case *parser.AndExpr:
-		left, err := evalExpr(e.Left, row, schema)
+		left, err := evalExpr(e.Left, row, schema, evalCtx)
 		if err != nil || !left {
 			return left, err
 		}
-		return evalExpr(e.Right, row, schema)
+		return evalExpr(e.Right, row, schema, evalCtx)
 	case *parser.OrExpr:
-		left, err := evalExpr(e.Left, row, schema)
+		left, err := evalExpr(e.Left, row, schema, evalCtx)
 		if err != nil {
 			return false, err
 		}
 		if left {
 			return true, nil
 		}
-		return evalExpr(e.Right, row, schema)
+		return evalExpr(e.Right, row, schema, evalCtx)
 	case *parser.NotExpr:
-		value, err := evalExpr(e.Expr, row, schema)
+		value, err := evalExpr(e.Expr, row, schema, evalCtx)
 		if err != nil {
 			return false, err
 		}
 		return !value, nil
+	case *parser.MatchExpr:
+		if evalCtx == nil || len(evalCtx.MatchScores) == 0 {
+			return false, nil
+		}
+		score := evalCtx.MatchScores[strings.ToLower(e.Column)]
+		return score > 0, nil
+	case *parser.LikeExpr:
+		value, err := resolveColumn(row, schema, e.Column)
+		if err != nil {
+			return false, err
+		}
+		text, ok := value.(string)
+		if !ok {
+			if value == nil {
+				return false, nil
+			}
+			return false, fmt.Errorf("column '%s' is not string and cannot be used with LIKE", e.Column)
+		}
+
+		matched := likeMatch(text, e.Pattern)
+		if e.Negated {
+			return !matched, nil
+		}
+		return matched, nil
 	case parser.Value:
 		if e.Type != "bool" {
 			return false, fmt.Errorf("WHERE literal '%s' must be boolean", e.Type)
@@ -56,12 +85,12 @@ func evalExpr(expr parser.Expression, row storage.Row, schema *storage.TableSche
 	}
 }
 
-func evalBinary(expr *parser.BinaryExpr, row storage.Row, schema *storage.TableSchema) (bool, error) {
-	left, err := evalOperand(expr.Left, row, schema)
+func evalBinary(expr *parser.BinaryExpr, row storage.Row, schema *storage.TableSchema, evalCtx *EvalContext) (bool, error) {
+	left, err := evalOperand(expr.Left, row, schema, evalCtx)
 	if err != nil {
 		return false, err
 	}
-	right, err := evalOperand(expr.Right, row, schema)
+	right, err := evalOperand(expr.Right, row, schema, evalCtx)
 	if err != nil {
 		return false, err
 	}
@@ -69,14 +98,14 @@ func evalBinary(expr *parser.BinaryExpr, row storage.Row, schema *storage.TableS
 	return compareValues(left, right, expr.Operator)
 }
 
-func evalOperand(expr parser.Expression, row storage.Row, schema *storage.TableSchema) (interface{}, error) {
+func evalOperand(expr parser.Expression, row storage.Row, schema *storage.TableSchema, evalCtx *EvalContext) (interface{}, error) {
 	switch e := expr.(type) {
 	case parser.Value:
 		return parserValueToRaw(e), nil
 	case *parser.ColumnRef:
 		return resolveColumn(row, schema, e.Name)
-	case *parser.BinaryExpr, *parser.AndExpr, *parser.OrExpr, *parser.NotExpr:
-		result, err := evalExpr(e, row, schema)
+	case *parser.BinaryExpr, *parser.AndExpr, *parser.OrExpr, *parser.NotExpr, *parser.MatchExpr, *parser.LikeExpr:
+		result, err := evalExpr(e, row, schema, evalCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -193,4 +222,43 @@ func toFloat(value interface{}) (float64, bool) {
 	default:
 		return 0, false
 	}
+}
+
+func likeMatch(text, pattern string) bool {
+	textRunes := []rune(text)
+	patternRunes := []rune(pattern)
+
+	textPos := 0
+	patternPos := 0
+	starPos := -1
+	matchPos := 0
+
+	for textPos < len(textRunes) {
+		if patternPos < len(patternRunes) && (patternRunes[patternPos] == '_' || patternRunes[patternPos] == textRunes[textPos]) {
+			textPos++
+			patternPos++
+			continue
+		}
+
+		if patternPos < len(patternRunes) && patternRunes[patternPos] == '%' {
+			starPos = patternPos
+			matchPos = textPos
+			patternPos++
+			continue
+		}
+
+		if starPos != -1 {
+			patternPos = starPos + 1
+			matchPos++
+			textPos = matchPos
+			continue
+		}
+
+		return false
+	}
+
+	for patternPos < len(patternRunes) && patternRunes[patternPos] == '%' {
+		patternPos++
+	}
+	return patternPos == len(patternRunes)
 }

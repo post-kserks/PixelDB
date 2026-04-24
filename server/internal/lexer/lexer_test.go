@@ -50,3 +50,41 @@ func TestLexerStringLiteral(t *testing.T) {
 		}
 	}
 }
+
+func TestLexerNewKeywords(t *testing.T) {
+	sql := "SELECT name, _score FROM heroes WHERE MATCH(bio, 'dragon') ORDER BY _score DESC LIMIT 5 OFFSET 2;"
+	l := New(sql)
+
+	want := []TokenType{
+		TOKEN_SELECT,
+		TOKEN_IDENT,
+		TOKEN_COMMA,
+		TOKEN_IDENT,
+		TOKEN_FROM,
+		TOKEN_IDENT,
+		TOKEN_WHERE,
+		TOKEN_MATCH,
+		TOKEN_LPAREN,
+		TOKEN_IDENT,
+		TOKEN_COMMA,
+		TOKEN_STRING_LIT,
+		TOKEN_RPAREN,
+		TOKEN_ORDER,
+		TOKEN_BY,
+		TOKEN_IDENT,
+		TOKEN_DESC,
+		TOKEN_LIMIT,
+		TOKEN_INT_LIT,
+		TOKEN_OFFSET,
+		TOKEN_INT_LIT,
+		TOKEN_SEMICOLON,
+		TOKEN_EOF,
+	}
+
+	for i, tokenType := range want {
+		tok := l.NextToken()
+		if tok.Type != tokenType {
+			t.Fatalf("token[%d]: expected %s, got %s (%q)", i, tokenType, tok.Type, tok.Literal)
+		}
+	}
+}

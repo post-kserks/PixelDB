@@ -1,18 +1,52 @@
 # PixelDB
 
-PixelDB is an educational SQL database with a retro RPG terminal style.
+PixelDB is an educational SQL database with a Go server, a C++17 client, JSON file storage, and Elasticsearch-like full-text search features.
 
-## Components
+## What Is Included
 
-- `server/` — Go TCP server with SQL lexer/parser, command executor, and JSON file storage.
-- `client/` — C++17 shared library (`libpixeldb`) and interactive shell (`pixeldb-shell`).
+- `server/` - TCP server (Go) with SQL lexer/parser, executor, storage engine, text analyzer, and inverted index.
+- `client/` - C++17 library (`libpixeldb`) and interactive shell (`pixeldb-shell`).
+- `data/` - runtime data directory for databases and tables.
 
-## Supported SQL
+## Supported SQL Features
 
-- DDL: `CREATE DATABASE`, `DROP DATABASE`, `CREATE TABLE`, `DROP TABLE`, `USE`
-- DML: `SELECT`, `INSERT`, `UPDATE`, `DELETE`
-- `WHERE` expressions with `AND`, `OR`, `NOT`, parentheses, and comparison operators
-- Data types: `INT`, `FLOAT`, `BOOL`, `TEXT`, `VARCHAR(n)`
+### Core SQL
+
+- DDL:
+  - `CREATE DATABASE`
+  - `DROP DATABASE`
+  - `USE`
+  - `CREATE TABLE`
+  - `DROP TABLE`
+- DML:
+  - `SELECT`
+  - `INSERT`
+  - `UPDATE`
+  - `DELETE`
+
+### Query Language
+
+- `WHERE` with `AND`, `OR`, `NOT`, parentheses, and operators: `=`, `!=`, `<`, `>`, `<=`, `>=`
+- `LIKE` and `NOT LIKE` (`%` and `_` patterns)
+- `ORDER BY ... ASC|DESC`
+- `LIMIT` and `OFFSET`
+
+### Full-Text Search
+
+- `CREATE INDEX idx_name ON table_name(text_column)`
+- `DROP INDEX idx_name ON table_name`
+- `MATCH(column, 'query text')` in `WHERE`
+- BM25 scoring
+- `_score` virtual projection column
+
+### Aggregations
+
+- `COUNT(*)`
+- `SUM(column)`
+- `AVG(column)`
+- `MIN(column)`
+- `MAX(column)`
+- `GROUP BY`
 
 ## Build
 
@@ -20,25 +54,36 @@ PixelDB is an educational SQL database with a retro RPG terminal style.
 ./build.sh
 ```
 
-Artifacts are placed into `build/`:
+Build artifacts are produced in `build/`:
 
 - `build/pixeldb-server`
-- `build/libpixeldb*`
 - `build/pixeldb-shell`
+- `build/libpixeldb*`
 
-## Run server
+## Run Server
 
 ```bash
 ./run.sh
 ./run.sh 0.0.0.0 7777
 ```
 
-## Run shell client
+Server flags (from binary):
+
+- `-host` (default `127.0.0.1`)
+- `-port` (default `5432`)
+- `-data` (default `./data`)
+
+## Run Shell Client
 
 ```bash
 ./build/pixeldb-shell
 ./build/pixeldb-shell 127.0.0.1 5432
 ```
+
+Client commands:
+
+- type SQL queries
+- `exit` or `quit` to close shell
 
 ## Tests
 
@@ -46,3 +91,8 @@ Artifacts are placed into `build/`:
 cd server
 GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod-cache go test ./...
 ```
+
+## Documentation
+
+- Detailed usage guide: `GUIDE.md`
+- Project change roadmap: `ROADMAP.md`

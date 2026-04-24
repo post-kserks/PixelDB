@@ -86,8 +86,10 @@ func (p *sqlParser) parseCreate() (Statement, error) {
 		return &CreateDatabaseStatement{DatabaseName: name}, nil
 	case lexer.TOKEN_TABLE:
 		return p.parseCreateTable()
+	case lexer.TOKEN_INDEX:
+		return p.parseCreateIndex()
 	default:
-		return nil, p.expectedError("DATABASE or TABLE", p.current())
+		return nil, p.expectedError("DATABASE, TABLE, or INDEX", p.current())
 	}
 }
 
@@ -132,6 +134,38 @@ func (p *sqlParser) parseCreateTable() (Statement, error) {
 	}
 
 	return &CreateTableStatement{TableName: tableName, Columns: columns}, nil
+}
+
+func (p *sqlParser) parseCreateIndex() (Statement, error) {
+	p.advance() // INDEX
+
+	indexName, err := p.consumeIdent("index name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.consume(lexer.TOKEN_ON, "ON"); err != nil {
+		return nil, err
+	}
+	tableName, err := p.consumeIdent("table name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.consume(lexer.TOKEN_LPAREN, "'('"); err != nil {
+		return nil, err
+	}
+	columnName, err := p.consumeIdent("column name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.consume(lexer.TOKEN_RPAREN, "')'"); err != nil {
+		return nil, err
+	}
+
+	return &CreateIndexStatement{
+		IndexName:  indexName,
+		TableName:  tableName,
+		ColumnName: columnName,
+	}, nil
 }
 
 func (p *sqlParser) parseColumnType() (string, int, error) {
@@ -191,9 +225,30 @@ func (p *sqlParser) parseDrop() (Statement, error) {
 			return nil, err
 		}
 		return &DropTableStatement{TableName: name}, nil
+	case lexer.TOKEN_INDEX:
+		return p.parseDropIndex()
 	default:
-		return nil, p.expectedError("DATABASE or TABLE", p.current())
+		return nil, p.expectedError("DATABASE, TABLE, or INDEX", p.current())
 	}
+}
+
+func (p *sqlParser) parseDropIndex() (Statement, error) {
+	p.advance() // INDEX
+	indexName, err := p.consumeIdent("index name")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.consume(lexer.TOKEN_ON, "ON"); err != nil {
+		return nil, err
+	}
+	tableName, err := p.consumeIdent("table name")
+	if err != nil {
+		return nil, err
+	}
+	return &DropIndexStatement{
+		IndexName: indexName,
+		TableName: tableName,
+	}, nil
 }
 
 func (p *sqlParser) parseUse() (Statement, error) {
@@ -208,15 +263,9 @@ func (p *sqlParser) parseUse() (Statement, error) {
 func (p *sqlParser) parseSelect() (Statement, error) {
 	p.advance() // SELECT
 
-	columns := make([]string, 0, 8)
-	if p.current().Type == lexer.TOKEN_STAR {
-		p.advance()
-	} else {
-		list, err := p.parseIdentifierList("column name")
-		if err != nil {
-			return nil, err
-		}
-		columns = list
+	items, err := p.parseSelectItems()
+	if err != nil {
+		return nil, err
 	}
 
 	if err := p.consume(lexer.TOKEN_FROM, "FROM"); err != nil {
@@ -237,7 +286,203 @@ func (p *sqlParser) parseSelect() (Statement, error) {
 		}
 	}
 
-	return &SelectStatement{Columns: columns, TableName: tableName, Where: where}, nil
+	groupBy := make([]string, 0, 2)
+	if p.current().Type == lexer.TOKEN_GROUP {
+		p.advance()
+		if err := p.consume(lexer.TOKEN_BY, "BY"); err != nil {
+			return nil, err
+		}
+		groupBy, err = p.parseIdentifierList("group by column")
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	orderBy := make([]OrderByItem, 0, 2)
+	if p.current().Type == lexer.TOKEN_ORDER {
+		p.advance()
+		if err := p.consume(lexer.TOKEN_BY, "BY"); err != nil {
+			return nil, err
+		}
+		orderBy, err = p.parseOrderByItems()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var limit *LimitClause
+	if p.current().Type == lexer.TOKEN_LIMIT {
+		limit, err = p.parseLimitClause()
+		if err != nil {
+			return nil, err
+		}
+	} else if p.current().Type == lexer.TOKEN_OFFSET {
+		return nil, p.expectedError("LIMIT before OFFSET", p.current())
+	}
+
+	return &SelectStatement{
+		Items:     items,
+		TableName: tableName,
+		Where:     where,
+		GroupBy:   groupBy,
+		OrderBy:   orderBy,
+		Limit:     limit,
+	}, nil
+}
+
+func (p *sqlParser) parseSelectItems() ([]SelectItem, error) {
+	if p.current().Type == lexer.TOKEN_STAR {
+		p.advance()
+		return []SelectItem{{Type: "all", ColumnName: "*"}}, nil
+	}
+
+	items := make([]SelectItem, 0, 4)
+	for {
+		item, err := p.parseSelectItem()
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+		if p.current().Type != lexer.TOKEN_COMMA {
+			break
+		}
+		p.advance()
+	}
+	return items, nil
+}
+
+func (p *sqlParser) parseSelectItem() (SelectItem, error) {
+	switch p.current().Type {
+	case lexer.TOKEN_COUNT, lexer.TOKEN_SUM, lexer.TOKEN_AVG, lexer.TOKEN_MIN, lexer.TOKEN_MAX:
+		return p.parseAggregateSelectItem()
+	case lexer.TOKEN_IDENT:
+		col := p.current().Literal
+		p.advance()
+		item := SelectItem{
+			Type:       "column",
+			ColumnName: col,
+		}
+		if strings.EqualFold(col, "_score") {
+			item.Type = "score"
+		}
+		alias, err := p.parseOptionalAlias()
+		if err != nil {
+			return SelectItem{}, err
+		}
+		item.Alias = alias
+		return item, nil
+	default:
+		return SelectItem{}, p.expectedError("column, _score, or aggregate expression", p.current())
+	}
+}
+
+func (p *sqlParser) parseAggregateSelectItem() (SelectItem, error) {
+	funcTok := p.current()
+	p.advance()
+
+	if err := p.consume(lexer.TOKEN_LPAREN, "'('"); err != nil {
+		return SelectItem{}, err
+	}
+
+	column := ""
+	if funcTok.Type == lexer.TOKEN_COUNT && p.current().Type == lexer.TOKEN_STAR {
+		column = "*"
+		p.advance()
+	} else {
+		col, err := p.consumeIdent("aggregate column")
+		if err != nil {
+			return SelectItem{}, err
+		}
+		column = col
+	}
+
+	if err := p.consume(lexer.TOKEN_RPAREN, "')'"); err != nil {
+		return SelectItem{}, err
+	}
+
+	alias, err := p.parseOptionalAlias()
+	if err != nil {
+		return SelectItem{}, err
+	}
+
+	return SelectItem{
+		Type:       "agg",
+		ColumnName: column,
+		AggFunc:    strings.ToUpper(funcTok.Literal),
+		Alias:      alias,
+	}, nil
+}
+
+func (p *sqlParser) parseOptionalAlias() (string, error) {
+	if p.current().Type != lexer.TOKEN_AS {
+		return "", nil
+	}
+	p.advance()
+	return p.consumeIdent("alias")
+}
+
+func (p *sqlParser) parseOrderByItems() ([]OrderByItem, error) {
+	items := make([]OrderByItem, 0, 2)
+	for {
+		col, err := p.consumeIdent("order by column")
+		if err != nil {
+			return nil, err
+		}
+		item := OrderByItem{Column: col}
+		if p.current().Type == lexer.TOKEN_ASC {
+			p.advance()
+		} else if p.current().Type == lexer.TOKEN_DESC {
+			item.Desc = true
+			p.advance()
+		}
+		items = append(items, item)
+
+		if p.current().Type != lexer.TOKEN_COMMA {
+			break
+		}
+		p.advance()
+	}
+	return items, nil
+}
+
+func (p *sqlParser) parseLimitClause() (*LimitClause, error) {
+	if err := p.consume(lexer.TOKEN_LIMIT, "LIMIT"); err != nil {
+		return nil, err
+	}
+	count, err := p.parseIntLiteral("LIMIT count")
+	if err != nil {
+		return nil, err
+	}
+	if count < 0 {
+		return nil, fmt.Errorf("syntax error: LIMIT must be >= 0")
+	}
+
+	offset := int64(0)
+	if p.current().Type == lexer.TOKEN_OFFSET {
+		p.advance()
+		offset, err = p.parseIntLiteral("OFFSET value")
+		if err != nil {
+			return nil, err
+		}
+		if offset < 0 {
+			return nil, fmt.Errorf("syntax error: OFFSET must be >= 0")
+		}
+	}
+
+	return &LimitClause{Count: int(count), Offset: int(offset)}, nil
+}
+
+func (p *sqlParser) parseIntLiteral(expected string) (int64, error) {
+	tok := p.current()
+	if tok.Type != lexer.TOKEN_INT_LIT {
+		return 0, p.expectedError(expected, tok)
+	}
+	value, err := strconv.ParseInt(tok.Literal, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer literal '%s' at line %d, col %d", tok.Literal, tok.Line, tok.Col)
+	}
+	p.advance()
+	return value, nil
 }
 
 func (p *sqlParser) parseInsert() (Statement, error) {
@@ -430,9 +675,44 @@ func (p *sqlParser) parseComparison() (Expression, error) {
 			return nil, err
 		}
 		return &BinaryExpr{Left: left, Operator: op, Right: right}, nil
+	case lexer.TOKEN_LIKE:
+		p.advance()
+		pattern, err := p.parseLikePattern()
+		if err != nil {
+			return nil, err
+		}
+		columnName, err := columnNameFromExpr(left)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeExpr{Column: columnName, Pattern: pattern}, nil
+	case lexer.TOKEN_NOT:
+		if p.peek().Type != lexer.TOKEN_LIKE {
+			return left, nil
+		}
+		p.advance() // NOT
+		p.advance() // LIKE
+		pattern, err := p.parseLikePattern()
+		if err != nil {
+			return nil, err
+		}
+		columnName, err := columnNameFromExpr(left)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeExpr{Column: columnName, Pattern: pattern, Negated: true}, nil
 	default:
 		return left, nil
 	}
+}
+
+func (p *sqlParser) parseLikePattern() (string, error) {
+	tok := p.current()
+	if tok.Type != lexer.TOKEN_STRING_LIT {
+		return "", p.expectedError("LIKE pattern string", tok)
+	}
+	p.advance()
+	return tok.Literal, nil
 }
 
 func (p *sqlParser) parsePrimary() (Expression, error) {
@@ -448,6 +728,8 @@ func (p *sqlParser) parsePrimary() (Expression, error) {
 			return nil, err
 		}
 		return expr, nil
+	case lexer.TOKEN_MATCH:
+		return p.parseMatch()
 	case lexer.TOKEN_IDENT:
 		p.advance()
 		return &ColumnRef{Name: tok.Literal}, nil
@@ -461,6 +743,36 @@ func (p *sqlParser) parsePrimary() (Expression, error) {
 	default:
 		return nil, p.expectedError("expression", tok)
 	}
+}
+
+func (p *sqlParser) parseMatch() (Expression, error) {
+	p.advance() // MATCH
+	if err := p.consume(lexer.TOKEN_LPAREN, "'('"); err != nil {
+		return nil, err
+	}
+
+	column, err := p.consumeIdent("MATCH column")
+	if err != nil {
+		return nil, err
+	}
+	if err := p.consume(lexer.TOKEN_COMMA, "','"); err != nil {
+		return nil, err
+	}
+
+	queryTok := p.current()
+	if queryTok.Type != lexer.TOKEN_STRING_LIT {
+		return nil, p.expectedError("MATCH query string", queryTok)
+	}
+	p.advance()
+
+	if err := p.consume(lexer.TOKEN_RPAREN, "')'"); err != nil {
+		return nil, err
+	}
+
+	return &MatchExpr{
+		Column: column,
+		Query:  queryTok.Literal,
+	}, nil
 }
 
 func (p *sqlParser) parseLiteralValue() (Value, error) {
@@ -557,6 +869,14 @@ func tokenToValue(tok lexer.Token) (Value, error) {
 	}
 }
 
+func columnNameFromExpr(expr Expression) (string, error) {
+	colRef, ok := expr.(*ColumnRef)
+	if !ok {
+		return "", fmt.Errorf("syntax error: LIKE requires column reference on the left side")
+	}
+	return colRef.Name, nil
+}
+
 func (p *sqlParser) consume(tokenType lexer.TokenType, expected string) error {
 	if p.current().Type != tokenType {
 		return p.expectedError(expected, p.current())
@@ -579,6 +899,13 @@ func (p *sqlParser) current() lexer.Token {
 		return lexer.Token{Type: lexer.TOKEN_EOF}
 	}
 	return p.tokens[p.pos]
+}
+
+func (p *sqlParser) peek() lexer.Token {
+	if p.pos+1 >= len(p.tokens) {
+		return lexer.Token{Type: lexer.TOKEN_EOF}
+	}
+	return p.tokens[p.pos+1]
 }
 
 func (p *sqlParser) advance() {

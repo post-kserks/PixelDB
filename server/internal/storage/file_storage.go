@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"pixeldb/internal/analyzer"
+	"pixeldb/internal/index"
 )
 
 type FileStorageEngine struct {
@@ -29,7 +32,12 @@ type databaseMeta struct {
 
 type tableDataDisk struct {
 	Rows   [][]interface{} `json:"rows"`
-	NextID int             `json:"next_id"`
+	RowIDs []int64         `json:"row_ids,omitempty"`
+	NextID int64           `json:"next_id"`
+}
+
+type tableIndexesDisk struct {
+	Indexes map[string]string `json:"indexes"` // index name -> column name
 }
 
 func NewFileStorageEngine(rootDir string) *FileStorageEngine {
@@ -149,8 +157,11 @@ func (s *FileStorageEngine) CreateTable(dbName string, schema TableSchema) error
 	if err := writeJSONAtomic(s.schemaPath(dbName, schema.Name), schema); err != nil {
 		return fmt.Errorf("write schema: %w", err)
 	}
-	if err := writeJSONAtomic(s.dataPath(dbName, schema.Name), tableDataDisk{Rows: [][]interface{}{}, NextID: 1}); err != nil {
+	if err := writeJSONAtomic(s.dataPath(dbName, schema.Name), tableDataDisk{Rows: [][]interface{}{}, RowIDs: []int64{}, NextID: 1}); err != nil {
 		return fmt.Errorf("write table data: %w", err)
+	}
+	if err := writeJSONAtomic(s.indexesPath(dbName, schema.Name), tableIndexesDisk{Indexes: map[string]string{}}); err != nil {
+		return fmt.Errorf("write table indexes metadata: %w", err)
 	}
 
 	s.getTableLock(dbName, schema.Name)
@@ -222,21 +233,21 @@ func (s *FileStorageEngine) InsertRows(dbName, tableName string, rows []Row) (in
 			normalized[i] = n
 		}
 		data.Rows = append(data.Rows, normalized)
+		data.RowIDs = append(data.RowIDs, data.NextID)
+		data.NextID++
 	}
-
-	if data.NextID <= 0 {
-		data.NextID = 1
-	}
-	data.NextID += len(rows)
 
 	if err := writeJSONAtomic(s.dataPath(dbName, tableName), data); err != nil {
 		return 0, fmt.Errorf("write table data: %w", err)
+	}
+	if err := s.syncIndexesLocked(dbName, tableName, schema, data); err != nil {
+		return 0, err
 	}
 
 	return len(rows), nil
 }
 
-func (s *FileStorageEngine) SelectRows(dbName, tableName string) ([]Row, error) {
+func (s *FileStorageEngine) SelectRows(dbName, tableName string) ([]IdentifiedRow, error) {
 	lock := s.getTableLock(dbName, tableName)
 	lock.RLock()
 	defer lock.RUnlock()
@@ -250,22 +261,22 @@ func (s *FileStorageEngine) SelectRows(dbName, tableName string) ([]Row, error) 
 		return nil, err
 	}
 
-	rows := make([]Row, 0, len(data.Rows))
-	for _, rawRow := range data.Rows {
+	rows := make([]IdentifiedRow, 0, len(data.Rows))
+	for i, rawRow := range data.Rows {
 		coerced, err := coerceRow(rawRow, schema)
 		if err != nil {
 			return nil, err
 		}
 		copied := make(Row, len(coerced))
 		copy(copied, coerced)
-		rows = append(rows, copied)
+		rows = append(rows, IdentifiedRow{RowID: data.RowIDs[i], Data: copied})
 	}
 
 	return rows, nil
 }
 
-func (s *FileStorageEngine) UpdateRows(dbName, tableName string, indices []int, updates map[string]Value) (int, error) {
-	if len(indices) == 0 {
+func (s *FileStorageEngine) UpdateRows(dbName, tableName string, rowIDs []int64, updates map[string]Value) (int, error) {
+	if len(rowIDs) == 0 {
 		return 0, nil
 	}
 
@@ -300,29 +311,34 @@ func (s *FileStorageEngine) UpdateRows(dbName, tableName string, indices []int, 
 		normalizedUpdates[idx] = normalized
 	}
 
-	unique := make(map[int]struct{}, len(indices))
-	for _, idx := range indices {
-		if idx < 0 || idx >= len(data.Rows) {
-			return 0, fmt.Errorf("row index %d out of range", idx)
-		}
-		unique[idx] = struct{}{}
+	targetIDs := make(map[int64]struct{}, len(rowIDs))
+	for _, id := range rowIDs {
+		targetIDs[id] = struct{}{}
 	}
 
-	for idx := range unique {
-		for colIdx, value := range normalizedUpdates {
-			data.Rows[idx][colIdx] = value
+	updated := 0
+	for i, id := range data.RowIDs {
+		if _, ok := targetIDs[id]; !ok {
+			continue
 		}
+		for colIdx, value := range normalizedUpdates {
+			data.Rows[i][colIdx] = value
+		}
+		updated++
 	}
 
 	if err := writeJSONAtomic(s.dataPath(dbName, tableName), data); err != nil {
 		return 0, fmt.Errorf("write table data: %w", err)
 	}
+	if err := s.syncIndexesLocked(dbName, tableName, schema, data); err != nil {
+		return 0, err
+	}
 
-	return len(unique), nil
+	return updated, nil
 }
 
-func (s *FileStorageEngine) DeleteRows(dbName, tableName string, indices []int) (int, error) {
-	if len(indices) == 0 {
+func (s *FileStorageEngine) DeleteRows(dbName, tableName string, rowIDs []int64) (int, error) {
+	if len(rowIDs) == 0 {
 		return 0, nil
 	}
 
@@ -339,27 +355,186 @@ func (s *FileStorageEngine) DeleteRows(dbName, tableName string, indices []int) 
 		return 0, err
 	}
 
-	indexSet := make(map[int]struct{}, len(indices))
-	for _, idx := range indices {
-		if idx < 0 || idx >= len(data.Rows) {
-			return 0, fmt.Errorf("row index %d out of range", idx)
-		}
-		indexSet[idx] = struct{}{}
+	targetIDs := make(map[int64]struct{}, len(rowIDs))
+	for _, id := range rowIDs {
+		targetIDs[id] = struct{}{}
 	}
 
-	filtered := make([][]interface{}, 0, len(data.Rows)-len(indexSet))
-	for i, row := range data.Rows {
-		if _, remove := indexSet[i]; !remove {
-			filtered = append(filtered, row)
+	filteredRows := make([][]interface{}, 0, len(data.Rows))
+	filteredIDs := make([]int64, 0, len(data.RowIDs))
+	deleted := 0
+	for i, id := range data.RowIDs {
+		if _, remove := targetIDs[id]; remove {
+			deleted++
+			continue
 		}
+		filteredRows = append(filteredRows, data.Rows[i])
+		filteredIDs = append(filteredIDs, id)
 	}
-	data.Rows = filtered
+	data.Rows = filteredRows
+	data.RowIDs = filteredIDs
 
 	if err := writeJSONAtomic(s.dataPath(dbName, tableName), data); err != nil {
 		return 0, fmt.Errorf("write table data: %w", err)
 	}
+	if err := s.syncIndexesLocked(dbName, tableName, schema, data); err != nil {
+		return 0, err
+	}
 
-	return len(indexSet), nil
+	return deleted, nil
+}
+
+func (s *FileStorageEngine) CreateIndex(dbName, tableName, indexName, columnName string) error {
+	if strings.TrimSpace(indexName) == "" {
+		return fmt.Errorf("index name cannot be empty")
+	}
+	if strings.TrimSpace(columnName) == "" {
+		return fmt.Errorf("column name cannot be empty")
+	}
+
+	lock := s.getTableLock(dbName, tableName)
+	lock.Lock()
+	defer lock.Unlock()
+
+	schema, err := s.readSchema(dbName, tableName)
+	if err != nil {
+		return err
+	}
+	columnIdx, column, err := resolveSchemaColumn(schema, columnName)
+	if err != nil {
+		return err
+	}
+	if column.Type != "TEXT" && column.Type != "VARCHAR" {
+		return fmt.Errorf("column '%s' must be TEXT or VARCHAR for full-text index", column.Name)
+	}
+
+	indexesMeta, err := s.readIndexesMeta(dbName, tableName)
+	if err != nil {
+		return err
+	}
+
+	for existingName, existingColumn := range indexesMeta.Indexes {
+		if strings.EqualFold(existingName, indexName) {
+			return fmt.Errorf("index '%s' already exists", existingName)
+		}
+		if strings.EqualFold(existingColumn, column.Name) {
+			return fmt.Errorf("column '%s' is already indexed by '%s'", column.Name, existingName)
+		}
+	}
+
+	data, err := s.readData(dbName, tableName, schema)
+	if err != nil {
+		return err
+	}
+
+	idx := index.NewInvertedIndex(column.Name, analyzer.NewStandardAnalyzer())
+	for i, row := range data.Rows {
+		rowID := data.RowIDs[i]
+		text := textFromIndexedValue(row[columnIdx])
+		idx.AddDocument(rowID, text)
+	}
+	if err := s.saveIndexLocked(dbName, tableName, column.Name, idx); err != nil {
+		return err
+	}
+
+	if indexesMeta.Indexes == nil {
+		indexesMeta.Indexes = make(map[string]string)
+	}
+	indexesMeta.Indexes[indexName] = column.Name
+	if err := s.writeIndexesMeta(dbName, tableName, indexesMeta); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *FileStorageEngine) DropIndex(dbName, tableName, indexName string) error {
+	if strings.TrimSpace(indexName) == "" {
+		return fmt.Errorf("index name cannot be empty")
+	}
+
+	lock := s.getTableLock(dbName, tableName)
+	lock.Lock()
+	defer lock.Unlock()
+
+	indexesMeta, err := s.readIndexesMeta(dbName, tableName)
+	if err != nil {
+		return err
+	}
+
+	foundName := ""
+	columnName := ""
+	for existingName, existingColumn := range indexesMeta.Indexes {
+		if strings.EqualFold(existingName, indexName) {
+			foundName = existingName
+			columnName = existingColumn
+			break
+		}
+	}
+	if foundName == "" {
+		return fmt.Errorf("index '%s' does not exist", indexName)
+	}
+
+	if err := os.Remove(s.indexPath(dbName, tableName, columnName)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove index file: %w", err)
+	}
+
+	delete(indexesMeta.Indexes, foundName)
+	return s.writeIndexesMeta(dbName, tableName, indexesMeta)
+}
+
+func (s *FileStorageEngine) GetIndex(dbName, tableName, columnName string) (*index.InvertedIndex, error) {
+	lock := s.getTableLock(dbName, tableName)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	indexesMeta, err := s.readIndexesMeta(dbName, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	actualColumn := ""
+	for _, col := range indexesMeta.Indexes {
+		if strings.EqualFold(col, columnName) {
+			actualColumn = col
+			break
+		}
+	}
+	if actualColumn == "" {
+		return nil, fmt.Errorf("index for column '%s' does not exist", columnName)
+	}
+
+	idx, err := index.Load(s.indexPath(dbName, tableName, actualColumn), analyzer.NewStandardAnalyzer())
+	if err != nil {
+		return nil, fmt.Errorf("load index for column '%s': %w", actualColumn, err)
+	}
+	return idx, nil
+}
+
+func (s *FileStorageEngine) SaveIndex(dbName, tableName, columnName string, idx *index.InvertedIndex) error {
+	lock := s.getTableLock(dbName, tableName)
+	lock.Lock()
+	defer lock.Unlock()
+
+	return s.saveIndexLocked(dbName, tableName, columnName, idx)
+}
+
+func (s *FileStorageEngine) ListIndexes(dbName, tableName string) ([]string, error) {
+	lock := s.getTableLock(dbName, tableName)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	meta, err := s.readIndexesMeta(dbName, tableName)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(meta.Indexes))
+	for name := range meta.Indexes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func (s *FileStorageEngine) databasesDir() string {
@@ -380,6 +555,14 @@ func (s *FileStorageEngine) schemaPath(dbName, tableName string) string {
 
 func (s *FileStorageEngine) dataPath(dbName, tableName string) string {
 	return filepath.Join(s.tableDir(dbName, tableName), "_data.json")
+}
+
+func (s *FileStorageEngine) indexesPath(dbName, tableName string) string {
+	return filepath.Join(s.tableDir(dbName, tableName), "_indexes.json")
+}
+
+func (s *FileStorageEngine) indexPath(dbName, tableName, columnName string) string {
+	return filepath.Join(s.tableDir(dbName, tableName), fmt.Sprintf("_index_%s.json", strings.ToLower(columnName)))
 }
 
 func (s *FileStorageEngine) getTableLock(dbName, tableName string) *sync.RWMutex {
@@ -426,6 +609,20 @@ func (s *FileStorageEngine) readData(dbName, tableName string, schema *TableSche
 		return nil, fmt.Errorf("decode data for table '%s': %w", tableName, err)
 	}
 
+	// Migration: synthesize row_ids for legacy data files that lack them.
+	if len(data.RowIDs) != len(data.Rows) {
+		data.RowIDs = make([]int64, len(data.Rows))
+		for i := range data.Rows {
+			data.RowIDs[i] = int64(i + 1)
+		}
+		if data.NextID < int64(len(data.Rows)+1) {
+			data.NextID = int64(len(data.Rows) + 1)
+		}
+	}
+	if data.NextID <= 0 {
+		data.NextID = 1
+	}
+
 	for i, row := range data.Rows {
 		coerced, err := coerceRow(row, schema)
 		if err != nil {
@@ -439,6 +636,97 @@ func (s *FileStorageEngine) readData(dbName, tableName string, schema *TableSche
 	}
 
 	return &data, nil
+}
+
+func (s *FileStorageEngine) readIndexesMeta(dbName, tableName string) (*tableIndexesDisk, error) {
+	path := s.indexesPath(dbName, tableName)
+	bytes, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return &tableIndexesDisk{Indexes: map[string]string{}}, nil
+		}
+		return nil, fmt.Errorf("read indexes metadata for table '%s': %w", tableName, err)
+	}
+
+	var meta tableIndexesDisk
+	if err := json.Unmarshal(bytes, &meta); err != nil {
+		return nil, fmt.Errorf("decode indexes metadata for table '%s': %w", tableName, err)
+	}
+	if meta.Indexes == nil {
+		meta.Indexes = make(map[string]string)
+	}
+	return &meta, nil
+}
+
+func (s *FileStorageEngine) writeIndexesMeta(dbName, tableName string, meta *tableIndexesDisk) error {
+	if meta == nil {
+		meta = &tableIndexesDisk{Indexes: map[string]string{}}
+	}
+	if meta.Indexes == nil {
+		meta.Indexes = make(map[string]string)
+	}
+	if err := writeJSONAtomic(s.indexesPath(dbName, tableName), meta); err != nil {
+		return fmt.Errorf("write indexes metadata: %w", err)
+	}
+	return nil
+}
+
+func (s *FileStorageEngine) saveIndexLocked(dbName, tableName, columnName string, idx *index.InvertedIndex) error {
+	if idx == nil {
+		return fmt.Errorf("cannot save nil index for column '%s'", columnName)
+	}
+	if err := index.Save(s.indexPath(dbName, tableName, columnName), idx); err != nil {
+		return fmt.Errorf("save index for column '%s': %w", columnName, err)
+	}
+	return nil
+}
+
+func (s *FileStorageEngine) syncIndexesLocked(dbName, tableName string, schema *TableSchema, data *tableDataDisk) error {
+	meta, err := s.readIndexesMeta(dbName, tableName)
+	if err != nil {
+		return err
+	}
+	if len(meta.Indexes) == 0 {
+		return nil
+	}
+
+	for _, columnName := range meta.Indexes {
+		columnIdx, column, err := resolveSchemaColumn(schema, columnName)
+		if err != nil {
+			return err
+		}
+
+		idx := index.NewInvertedIndex(column.Name, analyzer.NewStandardAnalyzer())
+		for rowPos, row := range data.Rows {
+			text := textFromIndexedValue(row[columnIdx])
+			idx.AddDocument(data.RowIDs[rowPos], text)
+		}
+		if err := s.saveIndexLocked(dbName, tableName, column.Name, idx); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func resolveSchemaColumn(schema *TableSchema, columnName string) (int, ColumnSchema, error) {
+	for i, col := range schema.Columns {
+		if strings.EqualFold(col.Name, columnName) {
+			return i, col, nil
+		}
+	}
+	return -1, ColumnSchema{}, fmt.Errorf("unknown column '%s'", columnName)
+}
+
+func textFromIndexedValue(value interface{}) string {
+	if value == nil {
+		return ""
+	}
+	text, ok := value.(string)
+	if !ok {
+		return fmt.Sprintf("%v", value)
+	}
+	return text
 }
 
 func coerceRow(raw []interface{}, schema *TableSchema) (Row, error) {

@@ -23,10 +23,27 @@ const (
 	TOKEN_DROP
 	TOKEN_DATABASE
 	TOKEN_TABLE
+	TOKEN_INDEX
+	TOKEN_ON
 	TOKEN_USE
 	TOKEN_AND
 	TOKEN_OR
 	TOKEN_NOT
+	TOKEN_MATCH
+	TOKEN_LIKE
+	TOKEN_LIMIT
+	TOKEN_OFFSET
+	TOKEN_ORDER
+	TOKEN_BY
+	TOKEN_ASC
+	TOKEN_DESC
+	TOKEN_COUNT
+	TOKEN_SUM
+	TOKEN_AVG
+	TOKEN_MIN
+	TOKEN_MAX
+	TOKEN_GROUP
+	TOKEN_AS
 	TOKEN_NULL
 	TOKEN_TRUE
 	TOKEN_FALSE
@@ -313,10 +330,27 @@ var keywords = map[string]TokenType{
 	"DROP":     TOKEN_DROP,
 	"DATABASE": TOKEN_DATABASE,
 	"TABLE":    TOKEN_TABLE,
+	"INDEX":    TOKEN_INDEX,
+	"ON":       TOKEN_ON,
 	"USE":      TOKEN_USE,
 	"AND":      TOKEN_AND,
 	"OR":       TOKEN_OR,
 	"NOT":      TOKEN_NOT,
+	"MATCH":    TOKEN_MATCH,
+	"LIKE":     TOKEN_LIKE,
+	"LIMIT":    TOKEN_LIMIT,
+	"OFFSET":   TOKEN_OFFSET,
+	"ORDER":    TOKEN_ORDER,
+	"BY":       TOKEN_BY,
+	"ASC":      TOKEN_ASC,
+	"DESC":     TOKEN_DESC,
+	"COUNT":    TOKEN_COUNT,
+	"SUM":      TOKEN_SUM,
+	"AVG":      TOKEN_AVG,
+	"MIN":      TOKEN_MIN,
+	"MAX":      TOKEN_MAX,
+	"GROUP":    TOKEN_GROUP,
+	"AS":       TOKEN_AS,
 	"NULL":     TOKEN_NULL,
 	"TRUE":     TOKEN_TRUE,
 	"FALSE":    TOKEN_FALSE,
@@ -362,6 +396,10 @@ func (t TokenType) String() string {
 		return "DATABASE"
 	case TOKEN_TABLE:
 		return "TABLE"
+	case TOKEN_INDEX:
+		return "INDEX"
+	case TOKEN_ON:
+		return "ON"
 	case TOKEN_USE:
 		return "USE"
 	case TOKEN_AND:
@@ -370,6 +408,36 @@ func (t TokenType) String() string {
 		return "OR"
 	case TOKEN_NOT:
 		return "NOT"
+	case TOKEN_MATCH:
+		return "MATCH"
+	case TOKEN_LIKE:
+		return "LIKE"
+	case TOKEN_LIMIT:
+		return "LIMIT"
+	case TOKEN_OFFSET:
+		return "OFFSET"
+	case TOKEN_ORDER:
+		return "ORDER"
+	case TOKEN_BY:
+		return "BY"
+	case TOKEN_ASC:
+		return "ASC"
+	case TOKEN_DESC:
+		return "DESC"
+	case TOKEN_COUNT:
+		return "COUNT"
+	case TOKEN_SUM:
+		return "SUM"
+	case TOKEN_AVG:
+		return "AVG"
+	case TOKEN_MIN:
+		return "MIN"
+	case TOKEN_MAX:
+		return "MAX"
+	case TOKEN_GROUP:
+		return "GROUP"
+	case TOKEN_AS:
+		return "AS"
 	case TOKEN_NULL:
 		return "NULL"
 	case TOKEN_TRUE:

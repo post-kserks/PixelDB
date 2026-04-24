@@ -1,0 +1,27 @@
+{
+  "rows": [
+    [
+      1,
+      "Aragorn",
+      10,
+      true,
+      9.8,
+      "Warrior king of Gondor",
+      2022
+    ],
+    [
+      2,
+      "Legolas",
+      null,
+      null,
+      null,
+      "Elven archer of Mirkwood",
+      null
+    ]
+  ],
+  "row_ids": [
+    1,
+    2
+  ],
+  "next_id": 3
+}

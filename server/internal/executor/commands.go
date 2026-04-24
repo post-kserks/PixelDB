@@ -2,11 +2,19 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"pixeldb/internal/parser"
 	"pixeldb/internal/storage"
 )
+
+type queryRow struct {
+	RowID       int64
+	Data        storage.Row
+	Score       float64
+	MatchScores map[string]float64 // key: lower-cased column name
+}
 
 type CreateDatabaseCommand struct {
 	stmt *parser.CreateDatabaseStatement
@@ -91,6 +99,48 @@ func (c *DropTableCommand) Execute(ctx *ExecutionContext) (*Result, error) {
 	return &Result{Type: "message", Message: fmt.Sprintf("Table '%s' dropped successfully.", c.stmt.TableName)}, nil
 }
 
+type CreateIndexCommand struct {
+	stmt *parser.CreateIndexStatement
+}
+
+func (c *CreateIndexCommand) Execute(ctx *ExecutionContext) (*Result, error) {
+	dbName, err := requireCurrentDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ctx.Storage.TableExists(dbName, c.stmt.TableName) {
+		return nil, fmt.Errorf("table '%s' does not exist", c.stmt.TableName)
+	}
+	if err := ctx.Storage.CreateIndex(dbName, c.stmt.TableName, c.stmt.IndexName, c.stmt.ColumnName); err != nil {
+		return nil, err
+	}
+	return &Result{
+		Type:    "message",
+		Message: fmt.Sprintf("Index '%s' created on %s(%s).", c.stmt.IndexName, c.stmt.TableName, c.stmt.ColumnName),
+	}, nil
+}
+
+type DropIndexCommand struct {
+	stmt *parser.DropIndexStatement
+}
+
+func (c *DropIndexCommand) Execute(ctx *ExecutionContext) (*Result, error) {
+	dbName, err := requireCurrentDB(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ctx.Storage.TableExists(dbName, c.stmt.TableName) {
+		return nil, fmt.Errorf("table '%s' does not exist", c.stmt.TableName)
+	}
+	if err := ctx.Storage.DropIndex(dbName, c.stmt.TableName, c.stmt.IndexName); err != nil {
+		return nil, err
+	}
+	return &Result{
+		Type:    "message",
+		Message: fmt.Sprintf("Index '%s' dropped from table '%s'.", c.stmt.IndexName, c.stmt.TableName),
+	}, nil
+}
+
 type SelectCommand struct {
 	stmt *parser.SelectStatement
 }
@@ -110,19 +160,23 @@ func (c *SelectCommand) Execute(ctx *ExecutionContext) (*Result, error) {
 		return nil, err
 	}
 
-	rows, err := ctx.Storage.SelectRows(dbName, c.stmt.TableName)
+	identifiedRows, err := ctx.Storage.SelectRows(dbName, c.stmt.TableName)
 	if err != nil {
 		return nil, err
 	}
 
-	projectIndices, projectColumns, err := resolveProjection(schema, c.stmt.Columns)
+	matchScoresByRow, err := precomputeMatchScores(ctx, dbName, c.stmt.TableName, c.stmt.Where)
 	if err != nil {
 		return nil, err
 	}
 
-	resultRows := make([][]string, 0, len(rows))
-	for _, row := range rows {
-		ok, err := evalExpr(c.stmt.Where, row, schema)
+	filteredRows := make([]queryRow, 0, len(identifiedRows))
+	for _, identified := range identifiedRows {
+		rowScores := matchScoresByRow[identified.RowID]
+		ok, err := evalExpr(c.stmt.Where, identified.Data, schema, &EvalContext{
+			RowID:       identified.RowID,
+			MatchScores: rowScores,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -130,17 +184,32 @@ func (c *SelectCommand) Execute(ctx *ExecutionContext) (*Result, error) {
 			continue
 		}
 
-		projected := make([]string, len(projectIndices))
-		for i, idx := range projectIndices {
-			projected[i] = valueToString(row[idx])
-		}
-		resultRows = append(resultRows, projected)
+		filteredRows = append(filteredRows, queryRow{
+			RowID:       identified.RowID,
+			Data:        identified.Data,
+			Score:       sumMatchScores(rowScores),
+			MatchScores: rowScores,
+		})
+	}
+
+	if hasAggregations(c.stmt.Items) || len(c.stmt.GroupBy) > 0 {
+		return executeAggregateSelect(c.stmt, schema, filteredRows)
+	}
+
+	if err := sortQueryRows(filteredRows, c.stmt.OrderBy, schema); err != nil {
+		return nil, err
+	}
+	filteredRows = applyLimitToQueryRows(filteredRows, c.stmt.Limit)
+
+	columns, rowValues, err := projectRows(c.stmt.Items, schema, filteredRows)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Result{
 		Type:    "rows",
-		Columns: projectColumns,
-		Rows:    resultRows,
+		Columns: columns,
+		Rows:    rowValues,
 	}, nil
 }
 
@@ -248,19 +317,19 @@ func (c *UpdateCommand) Execute(ctx *ExecutionContext) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := ctx.Storage.SelectRows(dbName, c.stmt.TableName)
+	identifiedRows, err := ctx.Storage.SelectRows(dbName, c.stmt.TableName)
 	if err != nil {
 		return nil, err
 	}
 
-	indices := make([]int, 0, len(rows))
-	for idx, row := range rows {
-		match, err := evalExpr(c.stmt.Where, row, schema)
+	rowIDs := make([]int64, 0, len(identifiedRows))
+	for _, identified := range identifiedRows {
+		match, err := evalExpr(c.stmt.Where, identified.Data, schema, nil)
 		if err != nil {
 			return nil, err
 		}
 		if match {
-			indices = append(indices, idx)
+			rowIDs = append(rowIDs, identified.RowID)
 		}
 	}
 
@@ -269,7 +338,7 @@ func (c *UpdateCommand) Execute(ctx *ExecutionContext) (*Result, error) {
 		return nil, err
 	}
 
-	affected, err := ctx.Storage.UpdateRows(dbName, c.stmt.TableName, indices, updates)
+	affected, err := ctx.Storage.UpdateRows(dbName, c.stmt.TableName, rowIDs, updates)
 	if err != nil {
 		return nil, err
 	}
@@ -314,23 +383,23 @@ func (c *DeleteCommand) Execute(ctx *ExecutionContext) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows, err := ctx.Storage.SelectRows(dbName, c.stmt.TableName)
+	identifiedRows, err := ctx.Storage.SelectRows(dbName, c.stmt.TableName)
 	if err != nil {
 		return nil, err
 	}
 
-	indices := make([]int, 0, len(rows))
-	for idx, row := range rows {
-		match, err := evalExpr(c.stmt.Where, row, schema)
+	rowIDs := make([]int64, 0, len(identifiedRows))
+	for _, identified := range identifiedRows {
+		match, err := evalExpr(c.stmt.Where, identified.Data, schema, nil)
 		if err != nil {
 			return nil, err
 		}
 		if match {
-			indices = append(indices, idx)
+			rowIDs = append(rowIDs, identified.RowID)
 		}
 	}
 
-	affected, err := ctx.Storage.DeleteRows(dbName, c.stmt.TableName, indices)
+	affected, err := ctx.Storage.DeleteRows(dbName, c.stmt.TableName, rowIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -344,34 +413,289 @@ func requireCurrentDB(ctx *ExecutionContext) (string, error) {
 	return *ctx.CurrentDB, nil
 }
 
-func resolveProjection(schema *storage.TableSchema, requested []string) ([]int, []string, error) {
-	if len(requested) == 0 {
-		indices := make([]int, len(schema.Columns))
-		columns := make([]string, len(schema.Columns))
-		for i, col := range schema.Columns {
-			indices[i] = i
-			columns[i] = col.Name
+func hasAggregations(items []parser.SelectItem) bool {
+	for _, item := range items {
+		if item.Type == "agg" {
+			return true
 		}
-		return indices, columns, nil
+	}
+	return false
+}
+
+func precomputeMatchScores(ctx *ExecutionContext, dbName, tableName string, where parser.Expression) (map[int64]map[string]float64, error) {
+	matchExprs := make([]*parser.MatchExpr, 0, 2)
+	collectMatchExpressions(where, &matchExprs)
+	if len(matchExprs) == 0 {
+		return map[int64]map[string]float64{}, nil
 	}
 
-	columnIndex := make(map[string]int, len(schema.Columns))
-	for i, col := range schema.Columns {
-		columnIndex[strings.ToLower(col.Name)] = i
+	byRow := make(map[int64]map[string]float64, 32)
+	for _, expr := range matchExprs {
+		idx, err := ctx.Storage.GetIndex(dbName, tableName, expr.Column)
+		if err != nil {
+			return nil, fmt.Errorf("MATCH(%s, ...): %w", expr.Column, err)
+		}
+
+		columnKey := strings.ToLower(expr.Column)
+		results := idx.Search(expr.Query)
+		for _, result := range results {
+			scores, ok := byRow[result.RowID]
+			if !ok {
+				scores = make(map[string]float64)
+				byRow[result.RowID] = scores
+			}
+			scores[columnKey] += result.Score
+		}
+	}
+	return byRow, nil
+}
+
+func collectMatchExpressions(expr parser.Expression, out *[]*parser.MatchExpr) {
+	switch e := expr.(type) {
+	case nil:
+		return
+	case *parser.MatchExpr:
+		*out = append(*out, e)
+	case *parser.AndExpr:
+		collectMatchExpressions(e.Left, out)
+		collectMatchExpressions(e.Right, out)
+	case *parser.OrExpr:
+		collectMatchExpressions(e.Left, out)
+		collectMatchExpressions(e.Right, out)
+	case *parser.NotExpr:
+		collectMatchExpressions(e.Expr, out)
+	case *parser.BinaryExpr:
+		collectMatchExpressions(e.Left, out)
+		collectMatchExpressions(e.Right, out)
+	}
+}
+
+func sumMatchScores(scores map[string]float64) float64 {
+	sum := 0.0
+	for _, value := range scores {
+		sum += value
+	}
+	return sum
+}
+
+func sortQueryRows(rows []queryRow, orderBy []parser.OrderByItem, schema *storage.TableSchema) error {
+	if len(orderBy) == 0 || len(rows) <= 1 {
+		return nil
 	}
 
-	indices := make([]int, 0, len(requested))
-	columns := make([]string, 0, len(requested))
-	for _, name := range requested {
-		idx, ok := columnIndex[strings.ToLower(name)]
+	var sortErr error
+	sort.SliceStable(rows, func(i, j int) bool {
+		if sortErr != nil {
+			return false
+		}
+
+		for _, item := range orderBy {
+			left, err := resolveOrderValue(rows[i], item.Column, schema)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			right, err := resolveOrderValue(rows[j], item.Column, schema)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+
+			cmp, err := compareOrderValues(left, right)
+			if err != nil {
+				sortErr = err
+				return false
+			}
+			if cmp == 0 {
+				continue
+			}
+			if item.Desc {
+				return cmp > 0
+			}
+			return cmp < 0
+		}
+		return false
+	})
+	return sortErr
+}
+
+func resolveOrderValue(row queryRow, column string, schema *storage.TableSchema) (interface{}, error) {
+	if strings.EqualFold(column, "_score") {
+		return row.Score, nil
+	}
+	return resolveColumn(row.Data, schema, column)
+}
+
+func compareOrderValues(left, right interface{}) (int, error) {
+	if left == nil && right == nil {
+		return 0, nil
+	}
+	if left == nil {
+		return -1, nil
+	}
+	if right == nil {
+		return 1, nil
+	}
+
+	if lf, ok := toFloat(left); ok {
+		rf, rok := toFloat(right)
+		if !rok {
+			return 0, fmt.Errorf("type mismatch in ORDER BY comparison: %T vs %T", left, right)
+		}
+		if lf < rf {
+			return -1, nil
+		}
+		if lf > rf {
+			return 1, nil
+		}
+		return 0, nil
+	}
+
+	switch l := left.(type) {
+	case string:
+		r, ok := right.(string)
 		if !ok {
-			return nil, nil, fmt.Errorf("unknown column '%s'", name)
+			return 0, fmt.Errorf("type mismatch in ORDER BY comparison: %T vs %T", left, right)
 		}
-		indices = append(indices, idx)
-		columns = append(columns, schema.Columns[idx].Name)
+		if l < r {
+			return -1, nil
+		}
+		if l > r {
+			return 1, nil
+		}
+		return 0, nil
+	case bool:
+		r, ok := right.(bool)
+		if !ok {
+			return 0, fmt.Errorf("type mismatch in ORDER BY comparison: %T vs %T", left, right)
+		}
+		if l == r {
+			return 0, nil
+		}
+		if !l && r {
+			return -1, nil
+		}
+		return 1, nil
+	default:
+		leftText := fmt.Sprintf("%v", left)
+		rightText := fmt.Sprintf("%v", right)
+		if leftText < rightText {
+			return -1, nil
+		}
+		if leftText > rightText {
+			return 1, nil
+		}
+		return 0, nil
+	}
+}
+
+func applyLimitToQueryRows(rows []queryRow, limit *parser.LimitClause) []queryRow {
+	if limit == nil {
+		return rows
+	}
+	if limit.Offset >= len(rows) {
+		return []queryRow{}
+	}
+	start := limit.Offset
+	end := start + limit.Count
+	if end > len(rows) {
+		end = len(rows)
+	}
+	if end < start {
+		end = start
+	}
+	return rows[start:end]
+}
+
+func projectRows(items []parser.SelectItem, schema *storage.TableSchema, rows []queryRow) ([]string, [][]string, error) {
+	if len(items) == 1 && items[0].Type == "all" {
+		return projectAllColumns(schema, rows), buildAllRows(schema, rows), nil
 	}
 
-	return indices, columns, nil
+	type projectionItem struct {
+		kind   string // column | score
+		colIdx int
+		header string
+	}
+	projection := make([]projectionItem, 0, len(items))
+	for _, item := range items {
+		switch item.Type {
+		case "column":
+			colIdx, colName, err := resolveColumnIndex(schema, item.ColumnName)
+			if err != nil {
+				return nil, nil, err
+			}
+			header := colName
+			if item.Alias != "" {
+				header = item.Alias
+			}
+			projection = append(projection, projectionItem{
+				kind:   "column",
+				colIdx: colIdx,
+				header: header,
+			})
+		case "score":
+			header := "_score"
+			if item.Alias != "" {
+				header = item.Alias
+			}
+			projection = append(projection, projectionItem{
+				kind:   "score",
+				header: header,
+			})
+		default:
+			return nil, nil, fmt.Errorf("unsupported select item type '%s' in non-aggregate query", item.Type)
+		}
+	}
+
+	headers := make([]string, len(projection))
+	for i, item := range projection {
+		headers[i] = item.header
+	}
+
+	resultRows := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		values := make([]string, len(projection))
+		for i, item := range projection {
+			switch item.kind {
+			case "column":
+				values[i] = valueToString(row.Data[item.colIdx])
+			case "score":
+				values[i] = valueToString(row.Score)
+			}
+		}
+		resultRows = append(resultRows, values)
+	}
+	return headers, resultRows, nil
+}
+
+func projectAllColumns(schema *storage.TableSchema, rows []queryRow) []string {
+	columns := make([]string, len(schema.Columns))
+	for i, col := range schema.Columns {
+		columns[i] = col.Name
+	}
+	return columns
+}
+
+func buildAllRows(schema *storage.TableSchema, rows []queryRow) [][]string {
+	result := make([][]string, 0, len(rows))
+	for _, row := range rows {
+		values := make([]string, len(schema.Columns))
+		for i := range schema.Columns {
+			values[i] = valueToString(row.Data[i])
+		}
+		result = append(result, values)
+	}
+	return result
+}
+
+func resolveColumnIndex(schema *storage.TableSchema, name string) (int, string, error) {
+	for i, col := range schema.Columns {
+		if strings.EqualFold(col.Name, name) {
+			return i, col.Name, nil
+		}
+	}
+	return -1, "", fmt.Errorf("unknown column '%s'", name)
 }
 
 func parserValueToColumnType(value parser.Value, col storage.ColumnSchema) (storage.Value, error) {
