@@ -39,15 +39,14 @@ func NewAutoVacuumWorker(e *PageStorageEngine, cfg AutoVacuumConfig) *AutoVacuum
 // Start launches the background ticker looping over RunVacuumAll.
 func (v *AutoVacuumWorker) Start() {
 	v.mu.Lock()
+	defer v.mu.Unlock()
 	if v.running {
-		v.mu.Unlock()
 		return
 	}
 	v.running = true
 	v.stopCh = make(chan struct{})
 	stopCh := v.stopCh
 	interval := v.config.Interval
-	v.mu.Unlock()
 
 	v.wg.Add(1)
 	go func() {
@@ -69,14 +68,15 @@ func (v *AutoVacuumWorker) Start() {
 // Stop terminates the background worker cleanly and thread-safely.
 func (v *AutoVacuumWorker) Stop() {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	if !v.running {
+		v.mu.Unlock()
 		return
 	}
 	v.running = false
 	if v.stopCh != nil {
 		close(v.stopCh)
 	}
+	v.mu.Unlock()
 	v.wg.Wait()
 }
 

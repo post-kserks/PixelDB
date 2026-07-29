@@ -98,7 +98,7 @@ func (s *PGWireServer) Start(ctx context.Context) error {
 			go func() {
 				defer s.wg.Done()
 				defer func() {
-					conn.Close()
+					_ = conn.Close()
 					s.mu.Lock()
 					delete(s.connections, conn)
 					s.mu.Unlock()
@@ -117,12 +117,12 @@ func (s *PGWireServer) Stop() {
 		s.cancel()
 	}
 	if s.listener != nil {
-		s.listener.Close()
+		_ = s.listener.Close()
 	}
 
 	s.mu.Lock()
 	for conn := range s.connections {
-		conn.Close()
+		_ = conn.Close()
 	}
 	s.mu.Unlock()
 

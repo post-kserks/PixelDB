@@ -54,7 +54,7 @@ func (e *PageStorageEngine) Vacuum(dbName, tableName string) (*VacuumStats, erro
 
 	total, err := t.heap.PageCount()
 	if err != nil {
-		os.Remove(shadowPath)
+		_ = os.Remove(shadowPath)
 		return nil, err
 	}
 
@@ -62,14 +62,14 @@ func (e *PageStorageEngine) Vacuum(dbName, tableName string) (*VacuumStats, erro
 	// Flush all dirty pages to disk before reading directly from heap files.
 	// Without this, write-back cached pages would be invisible to the scan.
 	if err := e.bufPool.FlushAll(); err != nil {
-		os.Remove(shadowPath)
+		_ = os.Remove(shadowPath)
 		return nil, fmt.Errorf("vacuum: flush dirty pages: %w", err)
 	}
 	for g := uint32(0); g < total; g++ {
 		pid := pageIDAt(t.tableID, g)
 		var pg page.Page
 		if err := t.heap.ReadPage(pid, &pg); err != nil {
-			os.Remove(shadowPath)
+			_ = os.Remove(shadowPath)
 			return nil, err
 		}
 		h := pg.Header()
@@ -107,21 +107,21 @@ func (e *PageStorageEngine) Vacuum(dbName, tableName string) (*VacuumStats, erro
 		pg.Init(page.PageTypeHeap)
 		for _, tuple := range live {
 			if _, err := pg.InsertTuple(tuple); err != nil {
-				os.Remove(shadowPath)
+				_ = os.Remove(shadowPath)
 				return nil, err
 			}
 		}
 		// Write to shadow file
 		if err := shadowHF.WritePage(pid, &pg); err != nil {
-			os.Remove(shadowPath)
+			_ = os.Remove(shadowPath)
 			return nil, err
 		}
 	}
 	if err := shadowHF.Sync(); err != nil {
-		os.Remove(shadowPath)
+		_ = os.Remove(shadowPath)
 		return nil, err
 	}
-	shadowHF.Close()
+	_ = shadowHF.Close()
 
 	// Write completion vacuum to WAL (before file replacement)
 	if e.wal != nil {
@@ -130,7 +130,7 @@ func (e *PageStorageEngine) Vacuum(dbName, tableName string) (*VacuumStats, erro
 			Table: tableName,
 		}
 		if _, err := e.wal.Append(wal.OpVacuumCommit, vacuumPayload); err != nil {
-			os.Remove(shadowPath)
+			_ = os.Remove(shadowPath)
 			return nil, fmt.Errorf("vacuum: wal commit: %w", err)
 		}
 	}
@@ -141,16 +141,16 @@ func (e *PageStorageEngine) Vacuum(dbName, tableName string) (*VacuumStats, erro
 	// we remove it first, then rename.
 	originalPath := e.tablePath(dbName, tableName)
 	if err := t.heap.Close(); err != nil {
-		os.RemoveAll(shadowPath)
+		_ = os.RemoveAll(shadowPath)
 		return nil, err
 	}
 
 	if err := os.RemoveAll(originalPath); err != nil {
-		os.RemoveAll(shadowPath)
+		_ = os.RemoveAll(shadowPath)
 		return nil, err
 	}
 	if err := os.Rename(shadowPath, originalPath); err != nil {
-		os.RemoveAll(shadowPath)
+		_ = os.RemoveAll(shadowPath)
 		return nil, err
 	}
 
@@ -207,7 +207,7 @@ func (e *PageStorageEngine) recoverOrphanedVacuums() {
 				vacuumPath := filepath.Join(dbDir, entry.Name())
 				slog.Warn("recovering orphaned vacuum directory",
 					"path", vacuumPath)
-				os.RemoveAll(vacuumPath)
+				_ = os.RemoveAll(vacuumPath)
 			}
 		}
 	}

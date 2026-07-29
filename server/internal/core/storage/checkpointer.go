@@ -34,15 +34,14 @@ func NewCheckpointerWorker(pool *BufferPool, interval time.Duration, batchSize i
 // Start launches the background checkpointer goroutine.
 func (c *CheckpointerWorker) Start() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.running {
-		c.mu.Unlock()
 		return
 	}
 	c.running = true
 	c.stopCh = make(chan struct{})
 	stopCh := c.stopCh
 	interval := c.interval
-	c.mu.Unlock()
 
 	c.wg.Add(1)
 	go func() {
@@ -64,14 +63,15 @@ func (c *CheckpointerWorker) Start() {
 // Stop cleanly terminates the checkpointer background loop.
 func (c *CheckpointerWorker) Stop() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if !c.running {
+		c.mu.Unlock()
 		return
 	}
 	c.running = false
 	if c.stopCh != nil {
 		close(c.stopCh)
 	}
+	c.mu.Unlock()
 	c.wg.Wait()
 }
 

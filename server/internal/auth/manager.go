@@ -347,7 +347,7 @@ func (m *Manager) SaveRevoked() {
 		if m.logger != nil {
 			m.logger.Error("failed to rename revoked tokens file", "error", err)
 		}
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 	}
 }
 

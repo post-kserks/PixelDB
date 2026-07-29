@@ -689,7 +689,7 @@ func TestWALRecoveryUndoIncompleteTx(t *testing.T) {
 		Table:     "users",
 		SegmentNo: 0,
 		PageNo:    0,
-		SlotNo:    0,
+		SlotNo:    1,
 		XID:       txID,
 		TupleData: tupleData,
 	}

@@ -70,7 +70,7 @@ func Restore(backupPath, dataDir string) error {
 			return err
 		}
 		if _, err := io.Copy(out, io.LimitReader(tr, 1<<30)); err != nil {
-			out.Close()
+			_ = out.Close()
 			return err
 		}
 		if err := out.Close(); err != nil {

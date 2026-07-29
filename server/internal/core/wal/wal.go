@@ -488,8 +488,19 @@ func readLPString(r *bytes.Reader) string {
 	return string(buf)
 }
 
+// File defines the filesystem interface required by WAL.
+type File interface {
+	io.Reader
+	io.Writer
+	io.Closer
+	io.Seeker
+	Sync() error
+	Truncate(size int64) error
+	Stat() (os.FileInfo, error)
+}
+
 type WAL struct {
-	file          *os.File
+	file          File
 	mu            sync.Mutex
 	nextTxID      atomic.Uint64
 	path          string
@@ -627,6 +638,9 @@ func (w *WAL) WriteFullPageImage(txID uint64, db, table string, segmentNo uint16
 }
 
 func (w *WAL) appendBytesLockedWithTx(txID uint64, opType byte, payload []byte) (uint64, error) {
+	if w.file == nil {
+		return 0, fmt.Errorf("wal file is closed")
+	}
 	record, err := buildRecord(txID, opType, payload, w.em, w.tde)
 	if err != nil {
 		return 0, err
@@ -663,6 +677,9 @@ func (w *WAL) appendBytesLockedWithTx(txID uint64, opType byte, payload []byte) 
 }
 
 func (w *WAL) appendBytesLocked(opType byte, payload []byte) (uint64, error) {
+	if w.file == nil {
+		return 0, fmt.Errorf("wal file is closed")
+	}
 	txID := w.nextTxID.Add(1)
 
 	record, err := buildRecord(txID, opType, payload, w.em, w.tde)
@@ -701,6 +718,9 @@ func (w *WAL) appendBytesLocked(opType byte, payload []byte) (uint64, error) {
 // writeRecordRaw writes a pre-built record to the WAL file.
 // Caller must hold w.mu. Does NOT sync — the caller manages sync policy.
 func (w *WAL) writeRecordRaw(rec WALRecord) error {
+	if w.file == nil {
+		return fmt.Errorf("wal file is closed")
+	}
 	if _, err := w.file.Write(rec.Data); err != nil {
 		return fmt.Errorf("wal: write record: %w", err)
 	}
@@ -789,6 +809,10 @@ func buildRecord(txID uint64, opType byte, payload []byte, enc *crypto.Encryptio
 func (w *WAL) Flush() (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	if w.file == nil {
+		return 0, fmt.Errorf("wal file is closed")
+	}
 
 	if err := w.file.Sync(); err != nil {
 		return 0, fmt.Errorf("wal flush: %w", err)

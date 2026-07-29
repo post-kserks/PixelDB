@@ -305,8 +305,9 @@ func main() {
 				logger.Warn("could not write token to file", "path", tokenPath, "error", werr)
 			} else if serr := f.Sync(); serr != nil {
 				logger.Warn("could not fsync token file", "path", tokenPath, "error", serr)
+				return
 			}
-			f.Close()
+			_ = f.Close()
 			logger.Warn("no API tokens configured; generated a one-time token",
 				"token_file", tokenPath,
 				"action", "read the token, then delete the file and set VAULTDB_API_TOKENS env var")

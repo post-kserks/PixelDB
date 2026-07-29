@@ -22,6 +22,10 @@ func (w *WAL) Checkpoint() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return errors.New("wal file is closed")
+	}
+
 	payload, err := EncodeWALPayloadBinary(CheckpointPayload{LSN: w.nextTxID.Load()})
 	if err != nil {
 		return fmt.Errorf("wal: marshal checkpoint payload: %w", err)
@@ -53,6 +57,10 @@ func (w *WAL) WriteCheckpointRecord() (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return 0, errors.New("wal file is closed")
+	}
+
 	payload, err := EncodeWALPayloadBinary(CheckpointPayload{LSN: w.nextTxID.Load()})
 	if err != nil {
 		return 0, fmt.Errorf("wal: marshal checkpoint payload: %w", err)
@@ -78,6 +86,10 @@ func (w *WAL) TruncateWAL() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return errors.New("wal file is closed")
+	}
+
 	if err := w.file.Truncate(0); err != nil {
 		return fmt.Errorf("wal: truncate after checkpoint: %w", err)
 	}
@@ -97,6 +109,9 @@ func (w *WAL) Recover() ([]Entry, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return nil, errors.New("wal file is closed")
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("wal: seek start: %w", err)
 	}
@@ -309,7 +324,7 @@ func (w *WAL) scanAndTruncate() (uint64, error) {
 	if info, err := w.file.Stat(); err == nil && info.Size() > validEnd {
 		if err := w.file.Truncate(validEnd); err != nil {
 			corruptPath := w.path + fmt.Sprintf(".corrupt.%d", time.Now().Unix())
-			w.file.Close()
+			_ = w.file.Close()
 			if renameErr := os.Rename(w.path, corruptPath); renameErr != nil {
 				return 0, fmt.Errorf(
 					"FATAL: WAL is corrupt and cannot be truncated or renamed. "+
@@ -337,6 +352,9 @@ func (w *WAL) AnalyzeTransactions() (committed map[uint64]bool, inProgress map[u
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return nil, nil, errors.New("wal file is closed")
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return nil, nil, fmt.Errorf("wal: seek start: %w", err)
 	}
@@ -382,6 +400,10 @@ func (w *WAL) AnalyzeTransactions() (committed map[uint64]bool, inProgress map[u
 func (w *WAL) Replay(callback func(Entry) error) error {
 	w.mu.Lock()
 
+	if w.file == nil {
+		w.mu.Unlock()
+		return errors.New("wal file is closed")
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		w.mu.Unlock()
 		return fmt.Errorf("wal: seek start: %w", err)
@@ -422,6 +444,10 @@ func (w *WAL) Replay(callback func(Entry) error) error {
 func (w *WAL) ReplayTransaction(txID uint64, callback func(Entry) error) error {
 	w.mu.Lock()
 
+	if w.file == nil {
+		w.mu.Unlock()
+		return errors.New("wal file is closed")
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		w.mu.Unlock()
 		return fmt.Errorf("wal: seek start: %w", err)
@@ -463,6 +489,9 @@ func (w *WAL) FindLastVacuumCommit(db, table string) (bool, uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if w.file == nil {
+		return false, 0, errors.New("wal file is closed")
+	}
 	if _, err := w.file.Seek(0, io.SeekStart); err != nil {
 		return false, 0, fmt.Errorf("wal: seek start: %w", err)
 	}
